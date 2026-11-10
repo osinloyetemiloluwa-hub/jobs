@@ -1,0 +1,223 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <title>Mini Runner</title>
+  <style>
+    body { font-family: system-ui, sans-serif; max-width: 960px; margin: 40px auto; padding: 0 16px; }
+    textarea { width: 100%; height: 140px; font-family: ui-monospace, monospace; font-size: 13px; }
+    input, select, button { font-size: 14px; padding: 8px; margin: 4px 0; }
+    pre { background: #111; color: #eee; padding: 12px; overflow: auto; border-radius: 6px; font-size: 12px; }
+    table { width: 100%; border-collapse: collapse; margin-top: 12px; }
+    th, td { text-align: left; border-bottom: 1px solid #ddd; padding: 8px; font-size: 13px; vertical-align: top; }
+    .row { display: flex; gap: 12px; flex-wrap: wrap; align-items: center; }
+    .muted { color: #666; font-size: 13px; }
+    button { cursor: pointer; }
+    .ok { color: #0a7a2f; font-weight: 600; }
+    .bad { color: #b00020; font-weight: 600; }
+  </style>
+</head>
+<body>
+  <h1>Mini Runner</h1>
+  <p class="muted">
+    Stateless tick system: Render control plane + Neon state + E2B sandbox execution.
+  </p>
+
+  <label>API key<br />
+    <input id="apiKey" type="password" size="52" placeholder="paste your RUNNER_API_KEYS value" />
+  </label>
+
+  <h2>Create monitor</h2>
+  <div class="row">
+    <label>Name <input id="name" placeholder="BTC price check" size="24" /></label>
+    <label>Language
+      <select id="language">
+        <option value="python">Python</option>
+        <option value="bash">Bash</option>
+      </select>
+    </label>
+    <label>Interval (s) <input id="interval" type="number" value="60" min="30" style="width:90px" /></label>
+    <label>Timeout (s) <input id="timeout" type="number" value="30" min="5" max="60" style="width:90px" /></label>
+  </div>
+
+  <textarea id="script">import urllib.request, json
+
+url = "https://api.coingecko.com/api/v3/simple/price?ids=bitcoin&vs_currencies=usd"
+with urllib.request.urlopen(url, timeout=10) as r:
+    data = json.load(r)
+
+price = data["bitcoin"]["usd"]
+print(f"BTC/USD = {price}")
+
+if price > 100000:
+    print("ALERT: above 100k")
+</textarea>
+
+  <div class="row">
+    <button id="create">Create monitor</button>
+    <span id="createStatus" class="muted"></span>
+  </div>
+
+  <h2>Monitors</h2>
+  <button id="refresh">Refresh</button>
+  <span id="listStatus" class="muted"></span>
+  <table>
+    <thead>
+      <tr>
+        <th>Name</th>
+        <th>Status</th>
+        <th>Interval</th>
+        <th>Next run</th>
+        <th>Actions</th>
+      </tr>
+    </thead>
+    <tbody id="monitorRows"></tbody>
+  </table>
+
+  <h2>Recent runs</h2>
+  <pre id="runOutput">Select "Runs" on a monitor to view output.</pre>
+
+  <script>
+    const $ = (id) => document.getElementById(id);
+    const key = () => $("apiKey").value.trim();
+
+    async function api(path, options = {}) {
+      const headers = {
+        "Content-Type": "application/json",
+        "X-API-Key": key(),
+        ...(options.headers || {}),
+      };
+      const res = await fetch(path, { ...options, headers });
+      if (!res.ok) {
+        const text = await res.text();
+        throw new Error(`${res.status}: ${text}`);
+      }
+      return res.json();
+    }
+
+    async function createMonitor() {
+      const body = {
+        name: $("name").value.trim(),
+        script: $("script").value,
+        language: $("language").value,
+        interval_seconds: Number($("interval").value),
+        timeout_seconds: Number($("timeout").value),
+      };
+      if (!body.name || !body.script) {
+        alert("Name and script are required");
+        return;
+      }
+      $("createStatus").textContent = "creating…";
+      try {
+        await api("/v1/monitors", { method: "POST", body: JSON.stringify(body) });
+        $("createStatus").textContent = "created";
+        $("name").value = "";
+        await loadMonitors();
+      } catch (e) {
+        $("createStatus").textContent = e.message;
+      }
+    }
+
+    async function loadMonitors() {
+      $("listStatus").textContent = "loading…";
+      try {
+        const monitors = await api("/v1/monitors");
+        const rows = $("monitorRows");
+        rows.innerHTML = "";
+        for (const m of monitors) {
+          const tr = document.createElement("tr");
+          tr.innerHTML = `
+            <td>${escapeHtml(m.name)}</td>
+            <td class="${m.last_status === "succeeded" ? "ok" : m.last_status === "failed" ? "bad" : ""}">
+              ${m.last_status || "—"}
+            </td>
+            <td>${m.interval_seconds}s</td>
+            <td>${new Date(m.next_run_at).toLocaleString()}</td>
+            <td>
+              <button data-action="toggle" data-id="${m.id}" data-enabled="${m.enabled}">
+                ${m.enabled ? "Disable" : "Enable"}
+              </button>
+              <button data-action="run" data-id="${m.id}">Run now</button>
+              <button data-action="runs" data-id="${m.id}">Runs</button>
+              <button data-action="delete" data-id="${m.id}">Delete</button>
+            </td>
+          `;
+          rows.appendChild(tr);
+        }
+        $("listStatus").textContent = `${monitors.length} monitor(s)`;
+      } catch (e) {
+        $("listStatus").textContent = e.message;
+      }
+    }
+
+    async function toggleMonitor(id, enabled) {
+      await api(`/v1/monitors/${id}`, {
+        method: "PATCH",
+        body: JSON.stringify({ enabled: !enabled }),
+      });
+      await loadMonitors();
+    }
+
+    async function runNow(id) {
+      await api(`/v1/monitors/${id}/run-now`, { method: "POST" });
+      $("runOutput").textContent = "Queued. The next cron tick will execute it.";
+    }
+
+    async function showRuns(id) {
+      const runs = await api(`/v1/monitors/${id}/runs?limit=10`);
+      if (!runs.length) {
+        $("runOutput").textContent = "No runs yet.";
+        return;
+      }
+      $("runOutput").textContent = runs.map((r) => {
+        return [
+          `status: ${r.status}`,
+          `started: ${r.started_at}`,
+          `finished: ${r.finished_at || "—"}`,
+          `exit_code: ${r.exit_code}`,
+          `--- stdout ---`,
+          r.stdout || "",
+          `--- stderr ---`,
+          r.stderr || "",
+          `--- error ---`,
+          r.error || "",
+        ].join("\n");
+      }).join("\n\n====================\n\n");
+    }
+
+    async function deleteMonitor(id) {
+      if (!confirm("Delete this monitor?")) return;
+      await api(`/v1/monitors/${id}`, { method: "DELETE" });
+      await loadMonitors();
+    }
+
+    function escapeHtml(s) {
+      return s.replace(/[&<>"']/g, (c) => ({
+        "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;"
+      }[c]));
+    }
+
+    $("create").onclick = createMonitor;
+    $("refresh").onclick = loadMonitors;
+
+    $("monitorRows").addEventListener("click", async (e) => {
+      const btn = e.target.closest("button");
+      if (!btn) return;
+      const id = btn.dataset.id;
+      try {
+        if (btn.dataset.action === "toggle") {
+          await toggleMonitor(id, btn.dataset.enabled === "true");
+        } else if (btn.dataset.action === "run") {
+          await runNow(id);
+        } else if (btn.dataset.action === "runs") {
+          await showRuns(id);
+        } else if (btn.dataset.action === "delete") {
+          await deleteMonitor(id);
+        }
+      } catch (err) {
+        $("runOutput").textContent = err.message;
+      }
+    });
+  </script>
+</body>
+</html>
